@@ -16,6 +16,27 @@ Prompt-assisted music production, end-to-end track creation, and Live session an
 
 ---
 
+## About this fork
+
+This fork of [ahujasid/ableton-mcp](https://github.com/ahujasid/ableton-mcp) adds what is needed to build a sound, render it and analyse the result without touching Live by hand:
+
+| Tool | What it does |
+|---|---|
+| `render_track_to_audio` | Records one track (post-FX) or the main output over a beat range to a WAV, in real time, and reports duration, sample rate and peak dBFS (warns when silent). Built on the resample capture from upstream PR #143 (`start_audio_export` / `get_audio_export_status` / `cancel_audio_export`, now with `source_track_index`). |
+| `get_device_parameters` / `set_device_parameter` | Now include Live's display text (`display_value`, e.g. "1.25 kHz") and, for choice parameters, `value_items`. |
+| `set_device_parameter_display` | Sets a parameter by display value: "800 Hz", "250 ms", "-6 dB", "BP12". |
+| `set_clip_automation` / `clear_clip_automation` | Draws or removes a parameter envelope in a Session or Arrangement clip (raw values or display values per point). |
+| `get_arrangement_clip_notes` | Reads MIDI notes from an Arrangement clip. |
+| `get_meter_levels` | Peak output meters of a track or the main track over a short window. |
+
+Also fixed: `load_instrument_or_effect` lists the devices on the track again, and `set_arrangement_time` reports the new playhead (upstream #134).
+
+Not possible through Live's API: saving the Live Set, and offline (faster than real time) export.
+
+Install with `uvx --from git+https://github.com/felixschwamm/ableton-mcp ableton-mcp` in place of `uvx ableton-mcp` below, and install the Remote Script with `uvx --from git+https://github.com/felixschwamm/ableton-mcp ableton-mcp-install-script`. Dataset recording and telemetry stay opt-in as upstream.
+
+---
+
 ## Quickstart
 
 Three steps: install `uv`, point your MCP client at the server, install the Ableton Remote Script.

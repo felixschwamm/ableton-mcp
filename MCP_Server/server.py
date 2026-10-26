@@ -1,10 +1,12 @@
 # ableton_mcp_server.py
 from mcp.server.fastmcp import FastMCP, Context
+import asyncio
 import socket
 import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Union
@@ -141,7 +143,9 @@ class AbletonConnection:
             "duplicate_session_clip_to_arrangement",
             "create_locator",
             "start_resample_capture", "get_resample_capture_status",
-            "cancel_resample_capture"
+            "cancel_resample_capture",
+            "load_browser_item", "set_clip_automation", "clear_clip_automation",
+            "set_device_parameter_display"
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -955,11 +959,11 @@ def load_instrument_or_effect(ctx: Context, track_index: int, uri: str, user_pro
         # Check if the instrument was loaded successfully
         if result.get("loaded", False):
             new_devices = result.get("new_devices", [])
+            devices = result.get("devices_after", [])
+            message = f"Loaded instrument with URI '{uri}' on track {track_index}."
             if new_devices:
-                return f"Loaded instrument with URI '{uri}' on track {track_index}. New devices: {', '.join(new_devices)}"
-            else:
-                devices = result.get("devices_after", [])
-                return f"Loaded instrument with URI '{uri}' on track {track_index}. Devices on track: {', '.join(devices)}"
+                message += f" New devices: {', '.join(new_devices)}."
+            return message + f" Devices on track: {', '.join(devices) or '(none)'}"
         else:
             return f"Failed to load instrument with URI '{uri}'"
     except Exception as e:
@@ -1401,10 +1405,11 @@ def start_audio_export(
     ctx: Context,
     start_time: float = 0.0,
     end_time: float = None,
+    source_track_index: int = None,
     user_prompt: str = ""
 ) -> str:
     """
-    Start exporting the arrangement's main output to audio.
+    Start exporting the arrangement's main output (or one track) to audio.
 
     Live's API has no render/export call, so this records the main output in
     REAL TIME: it adds an audio track named "MCP Resample" with its input set
@@ -1420,6 +1425,9 @@ def start_audio_export(
     - start_time: Beat to start from (default 0.0)
     - end_time: Beat to stop at. Defaults to the end of the last arrangement
       clip; add a bar or two if reverb/delay tails matter.
+    - source_track_index: Record only this track (post-FX, independent of its
+      mute/fader) instead of the main output. The capture track is then named
+      "MCP Render <track name>".
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
@@ -1432,6 +1440,8 @@ def start_audio_export(
         params = {"start_time": start_time}
         if end_time is not None:
             params["end_time"] = end_time
+        if source_track_index is not None:
+            params["source_track_index"] = source_track_index
         result = ableton.send_command("start_resample_capture", params)
         seconds = result.get("estimated_seconds", 0.0)
         return (
@@ -1489,22 +1499,13 @@ def get_audio_export_status(ctx: Context, destination_path: str = "", user_promp
         if not source:
             return summary + " The recorded clip was not found yet; check again in a moment."
         summary += f"\nRecorded file: {source}"
+        if os.path.isfile(source):
+            summary += "\n" + _describe_render(source)
 
         if destination_path:
-            import shutil
-
             if not os.path.isfile(source):
                 return summary + "\nCould not copy: the file is not reachable from this machine."
-            dest = os.path.expanduser(destination_path)
-            if os.path.isdir(dest) or destination_path.endswith(("/", "\\")):
-                os.makedirs(dest, exist_ok=True)
-                dest = os.path.join(dest, os.path.basename(source))
-            else:
-                parent = os.path.dirname(dest)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-            shutil.copyfile(source, dest)
-            summary += f"\nCopied to: {dest}"
+            summary += f"\nCopied to: {_copy_render(source, destination_path)}"
         return summary
     except Exception as e:
         logger.error(f"Error getting audio export status: {str(e)}")
@@ -1531,6 +1532,353 @@ def cancel_audio_export(ctx: Context, user_prompt: str = "") -> str:
     except Exception as e:
         logger.error(f"Error cancelling audio export: {str(e)}")
         return f"Error cancelling audio export: {str(e)}"
+
+
+# Peak below this counts as a silent render (muted source, no instrument, ...)
+SILENT_RENDER_DBFS = -80.0
+DEFAULT_RENDER_DIR = os.path.join(os.path.expanduser("~"), "ableton-mcp-renders")
+
+
+def _copy_render(source: str, destination_path: str) -> str:
+    """Copy a recorded WAV; a directory destination keeps the file name."""
+    import shutil
+
+    dest = os.path.expanduser(destination_path)
+    if os.path.isdir(dest) or destination_path.endswith(("/", "\\")):
+        os.makedirs(dest, exist_ok=True)
+        dest = os.path.join(dest, os.path.basename(source))
+    else:
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    shutil.copyfile(source, dest)
+    return dest
+
+
+def _describe_render(path: str) -> str:
+    from .audio_file import wav_stats
+
+    try:
+        stats = wav_stats(path)
+    except Exception as e:
+        return f"Could not analyse the WAV: {e}"
+    text = (
+        f"{stats['duration_s']:.2f}s, {stats['sample_rate']} Hz, "
+        f"{stats['channels']} ch, peak {stats['peak_dbfs']:.1f} dBFS"
+    )
+    if stats["peak_dbfs"] < SILENT_RENDER_DBFS:
+        text += (
+            f"\nWARNING: the render is silent (peak below {SILENT_RENDER_DBFS:.0f} dBFS). "
+            f"Is the source empty, without an instrument, or not playing in the Arrangement?"
+        )
+    return text
+
+
+async def _wait_for_stable_file(path: str, timeout: float = 5.0) -> None:
+    """Live may still be finalising the WAV right after recording stops."""
+    last = -1
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        size = os.path.getsize(path) if os.path.isfile(path) else -1
+        if size > 0 and size == last:
+            return
+        last = size
+        await asyncio.sleep(0.3)
+
+
+@mcp.tool()
+@rich_telemetry_tool("render_track_to_audio")
+@trajectory_tool("render_track_to_audio", modifying=True)
+async def render_track_to_audio(
+    ctx: Context,
+    track_index: int = None,
+    start_beat: float = 0.0,
+    length_beats: float = 16.0,
+    target_path: str = "",
+    cleanup: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """
+    Render a range of the Arrangement to a WAV file and wait until it is done.
+
+    Records in REAL TIME (length_beats at the current tempo, e.g. 8 bars at
+    120 BPM = 16 s) via an audio track whose input is the source track
+    (post-FX) or, without track_index, Resampling (the main output). Other
+    armed tracks, loop and metronome are restored afterwards. Playback must be
+    stopped first. Reports duration, sample rate and peak level, and warns
+    when the render is silent.
+
+    Parameters:
+    - track_index: Track to render; omit for the whole main output
+    - start_beat: Arrangement position to start from, in beats
+    - length_beats: How many beats to record
+    - target_path: File or directory to copy the WAV to (default:
+      ~/ableton-mcp-renders/)
+    - cleanup: Delete the temporary capture track afterwards (the copied WAV stays)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("start_resample_capture")
+        if missing:
+            return missing
+        if length_beats <= 0:
+            return "length_beats must be positive"
+        ableton = get_ableton_connection()
+        params = {"start_time": start_beat, "end_time": start_beat + length_beats}
+        if track_index is not None:
+            params["source_track_index"] = track_index
+        started = await asyncio.to_thread(
+            ableton.send_command, "start_resample_capture", params)
+
+        deadline = time.monotonic() + float(started.get("estimated_seconds", 0.0)) + 30.0
+        status: Dict[str, Any] = {}
+        while True:
+            await asyncio.sleep(0.5)
+            status = await asyncio.to_thread(
+                ableton.send_command, "get_resample_capture_status")
+            state = status.get("status")
+            if state == "error" or status.get("error"):
+                break
+            if state == "done" and status.get("file_path"):
+                break
+            if time.monotonic() > deadline:
+                await asyncio.to_thread(ableton.send_command, "cancel_resample_capture")
+                return f"Render timed out (last status: {status}). Capture cancelled."
+
+        if status.get("error"):
+            if cleanup:
+                await asyncio.to_thread(ableton.send_command, "cancel_resample_capture")
+            return f"Render failed: {status.get('error')}"
+
+        source = status["file_path"]
+        if not os.path.isfile(source):
+            return f"Recorded file {source} is not reachable from this machine."
+        await _wait_for_stable_file(source)
+        dest = _copy_render(source, target_path or (DEFAULT_RENDER_DIR + os.sep))
+        report = (
+            f"Rendered beats {start_beat}–{start_beat + length_beats} "
+            f"({'track ' + str(track_index) if track_index is not None else 'main output'})"
+            f" to {dest}\n{_describe_render(dest)}"
+        )
+        if status.get("reason") != "completed":
+            report += f"\nNote: capture ended early ({status.get('reason')})."
+        if cleanup:
+            await asyncio.to_thread(ableton.send_command, "cancel_resample_capture")
+        return report
+    except Exception as e:
+        logger.error(f"Error rendering audio: {str(e)}")
+        return f"Error rendering audio: {str(e)}"
+
+
+# ── Meters, clip automation, display-value parameters ──────────────────────────
+
+@mcp.tool()
+@telemetry_tool("get_meter_levels")
+@trajectory_tool("get_meter_levels")
+async def get_meter_levels(
+    ctx: Context,
+    track_index: int,
+    duration_s: float = 1.0,
+    user_prompt: str = "",
+) -> str:
+    """
+    Watch a track's output meters for a moment and report the peaks.
+
+    A quick "is there any signal?" check without rendering. Values are Live's
+    meter scale, 0.0 (silence) to 1.0 (full scale); they only move while
+    something plays.
+
+    Parameters:
+    - track_index: Track to watch; -1 for the main track
+    - duration_s: How long to sample (0 = a single reading, max 10)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("get_meter_levels")
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        duration_s = max(0.0, min(10.0, float(duration_s)))
+        deadline = time.monotonic() + duration_s
+        peaks = {"left": 0.0, "right": 0.0, "level": 0.0}
+        samples = 0
+        while True:
+            reading = await asyncio.to_thread(
+                ableton.send_command, "get_meter_levels", {"track_index": track_index})
+            samples += 1
+            for key in peaks:
+                if reading.get(key) is not None:
+                    peaks[key] = max(peaks[key], float(reading[key]))
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.05)
+        return json.dumps({
+            "track_index": track_index,
+            "track_name": reading.get("track_name"),
+            "is_playing": reading.get("is_playing"),
+            "peak_left": peaks["left"],
+            "peak_right": peaks["right"],
+            "peak_level": peaks["level"],
+            "samples": samples,
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error reading meters: {str(e)}")
+        return f"Error reading meters: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_clip_automation")
+@trajectory_tool("set_clip_automation", modifying=True)
+def set_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    device_index: int,
+    parameter_index: int,
+    points: List[Dict[str, Any]],
+    arrangement: bool = False,
+    clear_existing: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """
+    Draw a parameter's automation envelope inside a clip.
+
+    Live ramps linearly between the points. Each point is
+    {"time": beats_from_clip_start, "value": raw_value} or, using Live's own
+    display text, {"time": 4.0, "display": "800 Hz"}.
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: Session slot index, or the arrangement clip index (order of
+      get_arrangement_clips) when arrangement is true
+    - device_index: Index into the track's device chain; -1 for the mixer
+      (parameter 0 = volume, 1 = pan, 2+ = sends)
+    - parameter_index: Index into the device's parameters (see get_device_parameters)
+    - points: List of {"time", "value"} or {"time", "display"}
+    - arrangement: Address an Arrangement clip instead of a Session slot
+    - clear_existing: Remove the parameter's existing envelope first
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("set_clip_automation")
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_clip_automation", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "device_index": device_index,
+            "parameter_index": parameter_index,
+            "points": points,
+            "arrangement": arrangement,
+            "clear_existing": clear_existing,
+        })
+        return (
+            f"Wrote {result.get('points')} automation points for "
+            f"{result.get('parameter')} in clip '{result.get('clip_name')}' "
+            f"(beats {result.get('start')}–{result.get('end')}, "
+            f"{result.get('first_display')} → {result.get('last_display')})"
+        )
+    except Exception as e:
+        logger.error(f"Error setting clip automation: {str(e)}")
+        return f"Error setting clip automation: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("clear_clip_automation")
+@trajectory_tool("clear_clip_automation", modifying=True)
+def clear_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    device_index: int = None,
+    parameter_index: int = None,
+    arrangement: bool = False,
+    user_prompt: str = "",
+) -> str:
+    """
+    Remove automation from a clip: one parameter's envelope, or every
+    envelope when device_index/parameter_index are omitted.
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: Session slot index, or arrangement clip index when arrangement is true
+    - device_index: Device (-1 = mixer); omit to clear all envelopes
+    - parameter_index: Parameter; omit to clear all envelopes
+    - arrangement: Address an Arrangement clip instead of a Session slot
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("clear_clip_automation")
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        params = {"track_index": track_index, "clip_index": clip_index,
+                  "arrangement": arrangement}
+        if device_index is not None and parameter_index is not None:
+            params["device_index"] = device_index
+            params["parameter_index"] = parameter_index
+        result = ableton.send_command("clear_clip_automation", params)
+        return f"Cleared automation ({result.get('cleared')}) in clip '{result.get('clip_name')}'"
+    except Exception as e:
+        logger.error(f"Error clearing clip automation: {str(e)}")
+        return f"Error clearing clip automation: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_device_parameter_display")
+@trajectory_tool("set_device_parameter_display", modifying=True)
+def set_device_parameter_display(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    parameter_index: int,
+    display_value: str,
+    user_prompt: str = "",
+) -> str:
+    """
+    Set a device parameter by the value Live displays, e.g. "800 Hz",
+    "1.2 kHz", "250 ms", "-6 dB", "35 %", or a choice name like "BP12".
+
+    Finds the raw value whose display text is closest to the target. Units
+    are converted (kHz/Hz, s/ms). Parameters whose display is not numeric
+    (other than quantized choices) are not supported.
+
+    Parameters:
+    - track_index: Track that owns the device
+    - device_index: Index into the track's device chain
+    - parameter_index: Index into device.parameters
+    - display_value: Target as Live would show it
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("set_device_parameter_display")
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_device_parameter_display", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "parameter_index": parameter_index,
+            "display_value": display_value,
+        })
+        return (
+            f"Set {result.get('name', 'parameter')} to {result.get('display_value')} "
+            f"(requested {display_value}; raw {result.get('old_value')} → {result.get('value')})"
+        )
+    except Exception as e:
+        logger.error(f"Error setting device parameter by display value: {str(e)}")
+        return f"Error setting device parameter by display value: {str(e)}"
 
 
 # ── Dataset / preference tools (Supabase trajectory recording) ─────────────────

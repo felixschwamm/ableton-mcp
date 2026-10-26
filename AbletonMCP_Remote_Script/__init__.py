@@ -3,6 +3,7 @@ from __future__ import absolute_import, print_function, unicode_literals
 
 from _Framework.ControlSurface import ControlSurface
 import os
+import re
 import socket
 import json
 import threading
@@ -34,7 +35,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.8.0"
+SCRIPT_VERSION = "1.9.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -61,7 +62,21 @@ SCRIPT_CAPABILITIES = [
     "start_resample_capture",
     "get_resample_capture_status",
     "cancel_resample_capture",
+    "get_meter_levels",
+    "set_clip_automation",
+    "clear_clip_automation",
+    "set_device_parameter_display",
 ]
+
+
+class _Deferred(object):
+    """Returned by a main-thread handler whose reply has to wait for Live to
+    apply a change. After `ticks` (~100 ms each) finish() runs on the main
+    thread; its return value (which may be another _Deferred) is the reply."""
+
+    def __init__(self, finish, ticks=1):
+        self.finish = finish
+        self.ticks = ticks
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -313,7 +328,9 @@ class AbletonMCP(ControlSurface):
                                  # Resample capture drives transport and arm state
                                  "start_resample_capture",
                                  "get_resample_capture_status",
-                                 "cancel_resample_capture"]:
+                                 "cancel_resample_capture",
+                                 "set_clip_automation", "clear_clip_automation",
+                                 "set_device_parameter_display"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -416,14 +433,38 @@ class AbletonMCP(ControlSurface):
                         elif command_type == "start_resample_capture":
                             result = self._start_resample_capture(
                                 params.get("start_time", 0.0),
-                                params.get("end_time"))
+                                params.get("end_time"),
+                                params.get("source_track_index"))
                         elif command_type == "get_resample_capture_status":
                             result = self._get_resample_capture_status()
                         elif command_type == "cancel_resample_capture":
                             result = self._cancel_resample_capture()
+                        elif command_type == "set_clip_automation":
+                            result = self._set_clip_automation(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("device_index", 0),
+                                params.get("parameter_index", 0),
+                                params.get("points", []),
+                                bool(params.get("arrangement", False)),
+                                bool(params.get("clear_existing", True)))
+                        elif command_type == "clear_clip_automation":
+                            result = self._clear_clip_automation(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("device_index"),
+                                params.get("parameter_index"),
+                                bool(params.get("arrangement", False)))
+                        elif command_type == "set_device_parameter_display":
+                            result = self._set_device_parameter_display(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("parameter_index", 0),
+                                params.get("display_value", ""))
 
-                        # Put the result in the queue
-                        response_queue.put({"status": "success", "result": result})
+                        # Put the result in the queue (later, if the handler
+                        # has to wait for Live to apply the change)
+                        self._reply_when_ready(result, response_queue)
                     except Exception as e:
                         self.log_message("Error in main thread task: " + str(e))
                         self.log_message(traceback.format_exc())
@@ -481,6 +522,8 @@ class AbletonMCP(ControlSurface):
                 track_index = params.get("track_index", 0)
                 clip_index = params.get("clip_index", 0)
                 response["result"] = self._get_arrangement_clip_notes(track_index, clip_index)
+            elif command_type == "get_meter_levels":
+                response["result"] = self._get_meter_levels(params.get("track_index", 0))
             elif command_type == "get_device_parameters":
                 track_index = params.get("track_index", 0)
                 device_index = params.get("device_index", 0)
@@ -1017,7 +1060,10 @@ class AbletonMCP(ControlSurface):
         """Move the arrangement playhead to a position in beats"""
         try:
             self._song.current_song_time = float(time_val)
-            return {"current_song_time": self._song.current_song_time}
+            # Live applies the new position on the next tick; reading it back
+            # right away returned the previous playhead.
+            return _Deferred(
+                lambda: {"current_song_time": float(self._song.current_song_time)}, 1)
         except Exception as e:
             self.log_message("Error setting current song time: " + str(e))
             raise
@@ -1215,6 +1261,199 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error creating locator: " + str(e))
             raise
 
+    # ── Meters ─────────────────────────────────────────────────────────────────
+
+    def _get_meter_levels(self, track_index):
+        """Current output meters of a track (-1 = main track), 0.0 .. 1.0."""
+        if track_index == -1:
+            track = self._song.master_track
+        else:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+        result = {
+            "track_index": track_index,
+            "track_name": track.name,
+            "is_playing": bool(self._song.is_playing),
+        }
+        for key in ("output_meter_left", "output_meter_right", "output_meter_level"):
+            try:
+                result[key.replace("output_meter_", "")] = float(getattr(track, key))
+            except Exception:
+                result[key.replace("output_meter_", "")] = None
+        return result
+
+    # ── Clip automation ────────────────────────────────────────────────────────
+
+    def _automation_clip(self, track_index, clip_index, arrangement):
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if arrangement:
+            clips = list(track.arrangement_clips)
+            if clip_index < 0 or clip_index >= len(clips):
+                raise IndexError("Arrangement clip index out of range")
+            return track, clips[clip_index]
+        if clip_index < 0 or clip_index >= len(track.clip_slots):
+            raise IndexError("Clip index out of range")
+        slot = track.clip_slots[clip_index]
+        if not slot.has_clip:
+            raise Exception("No clip in slot")
+        return track, slot.clip
+
+    def _automation_parameter(self, track, device_index, parameter_index):
+        """device_index -1 addresses the mixer: 0 volume, 1 pan, 2+ sends."""
+        if device_index == -1:
+            mixer = track.mixer_device
+            params = [mixer.volume, mixer.panning] + list(mixer.sends)
+        else:
+            if device_index < 0 or device_index >= len(track.devices):
+                raise IndexError("Device index out of range")
+            params = list(track.devices[device_index].parameters)
+        if parameter_index < 0 or parameter_index >= len(params):
+            raise IndexError("Parameter index out of range")
+        return params[parameter_index]
+
+    def _set_clip_automation(self, track_index, clip_index, device_index,
+                             parameter_index, points, arrangement=False,
+                             clear_existing=True):
+        """Draw a clip envelope through breakpoints; Live ramps linearly
+        between them. A point is {"time": beats, "value": raw} or
+        {"time": beats, "display": "800 Hz"}; time is relative to the clip."""
+        try:
+            track, clip = self._automation_clip(track_index, clip_index, arrangement)
+            param = self._automation_parameter(track, device_index, parameter_index)
+            if not points:
+                raise ValueError("At least one point is required")
+            lo, hi = float(param.min), float(param.max)
+            resolved = []
+            for point in points:
+                t = max(0.0, float(point.get("time", point.get("time_beats", 0.0))))
+                if point.get("display") is not None:
+                    v = self._value_for_display(param, point["display"])
+                else:
+                    v = float(point["value"])
+                resolved.append((t, max(lo, min(hi, v))))
+            resolved.sort(key=lambda tv: tv[0])
+
+            envelope = clip.automation_envelope(param)
+            if envelope is not None and clear_existing:
+                clip.clear_envelope(param)
+                envelope = None
+            if envelope is None:
+                envelope = clip.create_automation_envelope(param)
+            if envelope is None:
+                raise Exception("Live refused to create an envelope for " + param.name)
+
+            for t, v in resolved:
+                envelope.insert_step(t, 0.0, v)
+            # A parameter moved by hand ignores its envelope until re-enabled.
+            try:
+                param.re_enable_automation()
+            except Exception:
+                pass
+            return {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "arrangement": bool(arrangement),
+                "clip_name": clip.name,
+                "parameter": param.name,
+                "points": len(resolved),
+                "start": resolved[0][0],
+                "end": resolved[-1][0],
+                "first_display": self._param_display_for(param, resolved[0][1]),
+                "last_display": self._param_display_for(param, resolved[-1][1]),
+            }
+        except Exception as e:
+            self.log_message("Error setting clip automation: " + str(e))
+            raise
+
+    def _clear_clip_automation(self, track_index, clip_index, device_index=None,
+                               parameter_index=None, arrangement=False):
+        try:
+            track, clip = self._automation_clip(track_index, clip_index, arrangement)
+            if device_index is None or parameter_index is None:
+                clip.clear_all_envelopes()
+                return {"clip_name": clip.name, "cleared": "all"}
+            param = self._automation_parameter(track, device_index, parameter_index)
+            clip.clear_envelope(param)
+            return {"clip_name": clip.name, "cleared": param.name}
+        except Exception as e:
+            self.log_message("Error clearing clip automation: " + str(e))
+            raise
+
+    # ── Parameters by display value ("800 Hz") ─────────────────────────────────
+
+    _DISPLAY_NUMBER = re.compile(r"^\s*([-+]?(?:\d+\.?\d*|\.\d+))\s*([a-z%]*)")
+    # Canonical units: Hz, ms, dB, %
+    _DISPLAY_UNIT_SCALE = {"khz": 1000.0, "s": 1000.0, "sec": 1000.0}
+
+    def _param_display_for(self, param, value):
+        try:
+            return str(param.str_for_value(value))
+        except Exception:
+            return None
+
+    def _display_number(self, text):
+        """'1.25 kHz' -> 1250.0, '0.5 s' -> 500.0, '-inf dB' -> -inf, else None."""
+        s = str(text).strip().lower()
+        if "inf" in s:
+            return float("-inf") if s.startswith("-") else float("inf")
+        m = self._DISPLAY_NUMBER.match(s)
+        if not m:
+            return None
+        return float(m.group(1)) * self._DISPLAY_UNIT_SCALE.get(m.group(2), 1.0)
+
+    def _value_for_display(self, param, target):
+        """Raw value whose display text is closest to `target`.
+
+        Quantized parameters match value_items by name. Continuous ones are
+        bisected over str_for_value(), assuming the display is monotonic.
+        """
+        target_text = str(target).strip()
+        if getattr(param, "is_quantized", False):
+            items = [str(v) for v in param.value_items]
+            for i, item in enumerate(items):
+                if item.strip().lower() == target_text.lower():
+                    return float(param.min) + i
+            raise ValueError("'%s' is not one of %s" % (target_text, items))
+
+        want = self._display_number(target_text)
+        if want is None:
+            raise ValueError("Could not read a number from '%s'" % target_text)
+
+        def shown(value):
+            text = self._param_display_for(param, value)
+            number = self._display_number(text)
+            if number is None:
+                raise ValueError("%s shows '%s', which is not numeric" % (param.name, text))
+            return number
+
+        lo, hi = float(param.min), float(param.max)
+        increasing = shown(hi) >= shown(lo)
+        for _ in range(48):
+            mid = (lo + hi) / 2.0
+            if (shown(mid) < want) == increasing:
+                lo = mid
+            else:
+                hi = mid
+        return lo if abs(shown(lo) - want) <= abs(shown(hi) - want) else hi
+
+    def _set_device_parameter_display(self, track_index, device_index,
+                                      parameter_index, display_value):
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if device_index < 0 or device_index >= len(track.devices):
+            raise IndexError("Device index out of range")
+        device = track.devices[device_index]
+        if parameter_index < 0 or parameter_index >= len(device.parameters):
+            raise IndexError("Parameter index out of range")
+        value = self._value_for_display(device.parameters[parameter_index], display_value)
+        result = self._set_device_parameter(track_index, device_index, parameter_index, value)
+        result["requested_display"] = str(display_value)
+        return result
+
     # ── Resample capture (audio export) ───────────────────────────────────────
     #
     # Live's API has no render/export call: File > Export Audio/Video exists
@@ -1254,7 +1493,25 @@ class AbletonMCP(ControlSurface):
         # Live 10 and earlier route by display string
         track.current_input_routing = "Resampling"
 
-    def _start_resample_capture(self, start_time, end_time):
+    def _route_input_to_track(self, capture, source):
+        """Record `source` post-FX instead of the main output."""
+        chosen = None
+        for routing in capture.available_input_routing_types:
+            attached = getattr(routing, "attached_object", None)
+            if attached is not None and attached == source:
+                chosen = routing
+                break
+            if chosen is None and str(routing.display_name) == source.name:
+                chosen = routing
+        if chosen is None:
+            raise Exception("Live offered no input from track '%s'" % source.name)
+        capture.input_routing_type = chosen
+        for channel in capture.available_input_routing_channels:
+            if str(channel.display_name).lower().replace("-", " ") == "post fx":
+                capture.input_routing_channel = channel
+                break
+
+    def _start_resample_capture(self, start_time, end_time, source_track_index=None):
         song = self._song
         state = self._resample_state()
         if state and state.get("status") in ("recording", "stopping"):
@@ -1274,10 +1531,21 @@ class AbletonMCP(ControlSurface):
         for track in previously_armed:
             track.arm = False
 
+        source = None
+        if source_track_index is not None:
+            source_track_index = int(source_track_index)
+            if source_track_index < 0 or source_track_index >= len(song.tracks):
+                raise IndexError("Source track index out of range")
+            source = song.tracks[source_track_index]
+
         song.create_audio_track(-1)
         track = song.tracks[len(song.tracks) - 1]
-        track.name = self.RESAMPLE_TRACK_NAME
-        self._route_input_to_resampling(track)
+        if source is None:
+            track.name = self.RESAMPLE_TRACK_NAME
+            self._route_input_to_resampling(track)
+        else:
+            track.name = "MCP Render " + source.name
+            self._route_input_to_track(track, source)
         # Monitoring Off: an armed Resampling track on Auto would feed the
         # main output back into itself.
         track.current_monitoring_state = 2
@@ -1510,6 +1778,21 @@ class AbletonMCP(ControlSurface):
     
     
     
+    def _reply_when_ready(self, result, response_queue):
+        """Queue the reply now, or after Live applied the change (_Deferred)."""
+        if not isinstance(result, _Deferred):
+            response_queue.put({"status": "success", "result": result})
+            return
+
+        def _resume():
+            try:
+                self._reply_when_ready(result.finish(), response_queue)
+            except Exception as e:
+                self.log_message("Error in deferred main thread task: " + str(e))
+                response_queue.put({"status": "error", "message": str(e)})
+
+        self.schedule_message(result.ticks, _resume)
+
     def _load_instrument_or_effect(self, track_index, uri):
         """Load an instrument or effect onto a track by its browser URI.
 
@@ -1543,6 +1826,7 @@ class AbletonMCP(ControlSurface):
             self._song.view.selected_track = track
             
             # Load the item
+            devices_before = [d.name for d in track.devices]
             app.browser.load_item(item)
             
             result = {
@@ -1551,12 +1835,29 @@ class AbletonMCP(ControlSurface):
                 "track_name": track.name,
                 "uri": item_uri
             }
-            return result
+            return self._after_devices_change(track, devices_before, result)
         except Exception as e:
             self.log_message("Error loading browser item: {0}".format(str(e)))
             self.log_message(traceback.format_exc())
             raise
     
+    def _after_devices_change(self, track, devices_before, result, tries=10):
+        """browser.load_item applies on a later tick, so the chain read right
+        after it is stale (the reply listed no devices). Wait until the chain
+        changes, or ~1 s, and report it as Live has it then."""
+        def finish(remaining=tries):
+            after = [d.name for d in track.devices]
+            if after == devices_before and remaining > 0:
+                return _Deferred(lambda: finish(remaining - 1), 1)
+            new_devices = list(after)
+            for name in devices_before:
+                if name in new_devices:
+                    new_devices.remove(name)
+            result["devices_after"] = ["%d: %s" % (i, n) for i, n in enumerate(after)]
+            result["new_devices"] = new_devices
+            return result
+        return _Deferred(finish, 1)
+
     # Substring markers that point a URI at a likely root. Unmatched URIs fall
     # back to the default search order.
     _URI_ROOT_HINTS = (
