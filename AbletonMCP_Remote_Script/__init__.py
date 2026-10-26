@@ -1934,6 +1934,17 @@ class AbletonMCP(ControlSurface):
     # a snapshot can never blow the stack or the payload size.
     _MAX_CHAIN_DEPTH = 4
 
+    def _param_display_value(self, param):
+        """Live's own text for the current value ("1.25 kHz", "BP12"), or None.
+
+        DeviceParameter has no value_string attribute; the LOM exposes the
+        display text through str_for_value().
+        """
+        try:
+            return str(param.str_for_value(param.value))
+        except Exception:
+            return None
+
     def _serialize_device(self, device, device_index, include_params=True, depth=0):
         info = {
             "index": device_index,
@@ -1962,8 +1973,14 @@ class AbletonMCP(ControlSurface):
                             "is_enabled": bool(getattr(param, "is_enabled", True)),
                             "is_quantized": bool(getattr(param, "is_quantized", False)),
                         }
-                        if hasattr(param, "value_string"):
-                            entry["value_string"] = str(param.value_string)
+                        display_value = self._param_display_value(param)
+                        if display_value is not None:
+                            entry["display_value"] = display_value
+                        if entry["is_quantized"]:
+                            try:
+                                entry["value_items"] = [str(v) for v in param.value_items]
+                            except Exception:
+                                pass
                         if hasattr(param, "automation_state"):
                             try:
                                 entry["automation_state"] = int(param.automation_state)
@@ -2303,7 +2320,7 @@ class AbletonMCP(ControlSurface):
             param = device.parameters[parameter_index]
             old = float(param.value)
             param.value = float(value)
-            return {
+            result = {
                 "track_index": track_index,
                 "device_index": device_index,
                 "parameter_index": parameter_index,
@@ -2313,6 +2330,10 @@ class AbletonMCP(ControlSurface):
                 "min": float(param.min),
                 "max": float(param.max),
             }
+            display_value = self._param_display_value(param)
+            if display_value is not None:
+                result["display_value"] = display_value
+            return result
         except Exception as e:
             self.log_message("Error setting device parameter: " + str(e))
             raise

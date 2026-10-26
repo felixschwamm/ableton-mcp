@@ -234,3 +234,72 @@ def test_browser_tree_caps_a_huge_folder_and_flags_it(script_module):
 
     assert len(category["children"]) == 64
     assert category["has_more"] is True
+
+
+# ------------------------------------------------------------------ device parameters
+
+class FakeParameter(object):
+    """Mimics a LOM DeviceParameter: display text comes from str_for_value(),
+    there is no value_string attribute."""
+
+    def __init__(self, name, value, display, value_items=None):
+        self.name = name
+        self.value = value
+        self.min = 0.0
+        self.max = 1.0
+        self.is_enabled = True
+        self.is_quantized = value_items is not None
+        self.value_items = value_items or []
+        self._display = display
+
+    def str_for_value(self, value):
+        return self._display(value)
+
+
+class FakeDevice(object):
+    name = "Analog"
+    class_name = "UltraAnalog"
+    class_display_name = "Analog"
+    can_have_drum_pads = False
+    can_have_chains = False
+
+    def __init__(self, parameters):
+        self.parameters = parameters
+
+
+class FakeSong(object):
+    def __init__(self, devices):
+        track = types.SimpleNamespace(devices=devices)
+        self.tracks = [track]
+
+
+def _device_instance(script_module, parameters):
+    inst = make_instance(script_module)
+    inst._song = FakeSong([FakeDevice(parameters)])
+    return inst
+
+
+def test_device_parameters_report_live_display_text(script_module):
+    """Regression: the reader looked for a value_string attribute that the
+    LOM doesn't have, so only raw 0..1 values came back."""
+    freq = FakeParameter("F1 Freq", 0.25, lambda v: "%d Hz" % int(v * 3200))
+    f_type = FakeParameter("F1 Type", 1.0, lambda v: ["LP12", "BP12"][int(v)],
+                           value_items=["LP12", "BP12"])
+    inst = _device_instance(script_module, [freq, f_type])
+
+    params = inst._get_device_parameters(0, 0)["device"]["parameters"]
+
+    assert params[0]["display_value"] == "800 Hz"
+    assert "value_items" not in params[0]
+    assert params[1]["display_value"] == "BP12"
+    assert params[1]["value_items"] == ["LP12", "BP12"]
+
+
+def test_set_device_parameter_returns_new_display_text(script_module):
+    freq = FakeParameter("F1 Freq", 0.25, lambda v: "%d Hz" % int(v * 3200))
+    inst = _device_instance(script_module, [freq])
+
+    result = inst._set_device_parameter(0, 0, 0, 0.5)
+
+    assert result["value"] == 0.5
+    assert result["display_value"] == "1600 Hz"

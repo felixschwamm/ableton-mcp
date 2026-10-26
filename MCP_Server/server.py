@@ -522,6 +522,10 @@ def get_device_parameters(
     """
     Read all parameters for a device on a track (name, value, min, max).
 
+    Each parameter also carries display_value, Live's own text for the
+    current value (e.g. "1.25 kHz", "250 ms", "-6.0 dB"), and quantized
+    parameters list their choices in value_items (e.g. filter type names).
+
     Parameters:
     - track_index: Track that owns the device
     - device_index: Index into the track's device chain
@@ -573,10 +577,13 @@ def set_device_parameter(
                 "value": value,
             },
         )
-        return (
+        message = (
             f"Set {result.get('name', 'parameter')} "
             f"{result.get('old_value')} → {result.get('value')}"
         )
+        if result.get("display_value") is not None:
+            message += f" ({result['display_value']})"
+        return message
     except Exception as e:
         logger.error(f"Error setting device parameter: {str(e)}")
         return f"Error setting device parameter: {str(e)}"
