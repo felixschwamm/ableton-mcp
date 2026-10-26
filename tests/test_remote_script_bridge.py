@@ -303,3 +303,49 @@ def test_set_device_parameter_returns_new_display_text(script_module):
 
     assert result["value"] == 0.5
     assert result["display_value"] == "1600 Hz"
+# ------------------------------------------------------------------ arrangement notes
+
+class FakeNote(object):
+    def __init__(self, pitch, start_time):
+        self.pitch = pitch
+        self.start_time = start_time
+        self.duration = 1.0
+        self.velocity = 100
+        self.mute = False
+
+
+class FakeMidiClip(object):
+    is_midi_clip = True
+
+    def __init__(self, name, start_time, notes):
+        self.name = name
+        self.start_time = start_time
+        self.length = 16.0
+        self._notes = notes
+
+    def get_notes_extended(self, from_pitch, pitch_span, from_time, time_span):
+        return list(self._notes)
+
+
+def test_arrangement_clip_notes_read_the_indexed_arrangement_clip(script_module):
+    first = FakeMidiClip("A", 0.0, [FakeNote(45, 0.0)])
+    second = FakeMidiClip("B", 16.0, [FakeNote(45, 0.0), FakeNote(57, 4.0)])
+    inst = make_instance(script_module)
+    inst._song = types.SimpleNamespace(
+        tracks=[types.SimpleNamespace(arrangement_clips=[first, second])])
+
+    result = inst._get_arrangement_clip_notes(0, 1)
+
+    assert result["clip_name"] == "B"
+    assert result["start_time"] == 16.0
+    assert result["note_count"] == 2
+    assert [n["pitch"] for n in result["notes"]] == [45, 57]
+
+
+def test_arrangement_clip_notes_reject_out_of_range_index(script_module):
+    inst = make_instance(script_module)
+    inst._song = types.SimpleNamespace(
+        tracks=[types.SimpleNamespace(arrangement_clips=[])])
+
+    with pytest.raises(IndexError):
+        inst._get_arrangement_clip_notes(0, 0)

@@ -159,6 +159,31 @@ def test_add_notes_forwards_track_clip_and_notes(fake_conn):
 
 
 # --------------------------------------------------------------------------
+# get_arrangement_clip_notes
+# --------------------------------------------------------------------------
+
+def test_arrangement_read_sends_correct_command_and_params(fake_conn):
+    conn = fake_conn(response=_sample_response())
+    call(server.get_arrangement_clip_notes, None, track_index=1, clip_index=3)
+    assert conn.sent == [("get_arrangement_clip_notes", {"track_index": 1, "clip_index": 3})]
+
+
+def test_arrangement_read_returns_the_payload_as_json(fake_conn):
+    response = dict(_sample_response(), start_time=16.0)
+    fake_conn(response=response)
+    payload = json.loads(call(server.get_arrangement_clip_notes, None, 0, 1))
+    assert payload["start_time"] == 16.0
+    assert payload["notes"] == SAMPLE_NOTES
+
+
+def test_arrangement_read_connection_error_is_reported(fake_conn):
+    fake_conn(raise_exc=RuntimeError("Clip index out of range"))
+    out = call(server.get_arrangement_clip_notes, None, 0, 9)
+    assert out.startswith("Error getting arrangement clip notes")
+    assert "Clip index out of range" in out
+
+
+# --------------------------------------------------------------------------
 # clear_notes_from_clip  +  the true replace loop
 # --------------------------------------------------------------------------
 
