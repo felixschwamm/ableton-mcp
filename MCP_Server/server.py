@@ -511,6 +511,44 @@ def get_clip_notes(
 
 
 @mcp.tool()
+@telemetry_tool("get_arrangement_clip_notes")
+@trajectory_tool("get_arrangement_clip_notes")
+def get_arrangement_clip_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    user_prompt: str = "",
+) -> str:
+    """
+    Read all MIDI notes from a clip placed in the Arrangement timeline.
+
+    Same note shape as get_clip_notes. Note start times are relative to the
+    clip; the clip's own start_time (in beats) is returned alongside.
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: The index of the clip within track.arrangement_clips, in the
+      same order returned by get_arrangement_clips (i.e. ordered by start_time)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("get_arrangement_clip_notes")
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        result = ableton.send_command(
+            "get_arrangement_clip_notes",
+            {"track_index": track_index, "clip_index": clip_index},
+        )
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting arrangement clip notes: {str(e)}")
+        return f"Error getting arrangement clip notes: {str(e)}"
+
+
+@mcp.tool()
 @telemetry_tool("get_device_parameters")
 @trajectory_tool("get_device_parameters")
 def get_device_parameters(

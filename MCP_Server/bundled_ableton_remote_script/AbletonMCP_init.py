@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.8.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -42,6 +42,7 @@ SCRIPT_CAPABILITIES = [
     "get_track_info",
     "get_script_info",
     "get_clip_notes",
+    "get_arrangement_clip_notes",
     "get_device_parameters",
     "get_session_snapshot",
     "set_device_parameter",
@@ -456,6 +457,10 @@ class AbletonMCP(ControlSurface):
                 track_index = params.get("track_index", 0)
                 clip_index = params.get("clip_index", 0)
                 response["result"] = self._get_clip_notes(track_index, clip_index)
+            elif command_type == "get_arrangement_clip_notes":
+                track_index = params.get("track_index", 0)
+                clip_index = params.get("clip_index", 0)
+                response["result"] = self._get_arrangement_clip_notes(track_index, clip_index)
             elif command_type == "get_device_parameters":
                 track_index = params.get("track_index", 0)
                 device_index = params.get("device_index", 0)
@@ -2196,6 +2201,36 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error getting clip notes: " + str(e))
+            raise
+
+    def _get_arrangement_clip_notes(self, track_index, clip_index):
+        """Read MIDI notes from a clip placed in the Arrangement timeline.
+
+        clip_index indexes into track.arrangement_clips, in the same order
+        as returned by _get_arrangement_clips (i.e. ordered by start_time).
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            arrangement_clips = list(track.arrangement_clips)
+            if clip_index < 0 or clip_index >= len(arrangement_clips):
+                raise IndexError("Clip index out of range")
+            clip = arrangement_clips[clip_index]
+            if not getattr(clip, "is_midi_clip", False):
+                raise Exception("Clip is not a MIDI clip")
+            notes = self._notes_from_clip(clip)
+            return {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "clip_name": clip.name,
+                "start_time": float(clip.start_time),
+                "length": float(clip.length),
+                "note_count": len(notes),
+                "notes": notes,
+            }
+        except Exception as e:
+            self.log_message("Error getting arrangement clip notes: " + str(e))
             raise
 
     def _get_device_parameters(self, track_index, device_index):
